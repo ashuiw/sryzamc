@@ -21,25 +21,74 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features
       - run: cargo test --workspace
       - run: cargo build --release --workspace
-  release:
+  launcher-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '25'
+      - run: mkdir -p target/launcher-classes
+      - run: javac --release 25 -d target/launcher-classes launcher/src/main/java/io/sryza/Bootstrap.java
+  release-native:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
+            artifact: linux-x86_64
+            binary: sryzamc
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: linux-aarch64
+            binary: sryzamc
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            target: aarch64-apple-darwin
+            artifact: windows-x86_64
+            binary: sryzamc.exe
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: cargo build --release --target ${{ matrix.target }}
+      - shell: bash
+        run: |
+          mkdir -p dist-native
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist-native/sryzamc-${{ matrix.artifact }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.artifact }}
+          path: dist-native/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, launcher-check, release-native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: microsoft
+          java-version: '25'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: release/natives
+          merge-multiple: true
+      - run: chmod +x release/natives/sryzamc-linux-x86_64 release/natives/sryzamc-linux-aarch64
+      - run: ./launcher/build-jar.sh release/natives release/SryzaMC/server.jar
+      - run: java -jar release/SryzaMC/server.jar info
+      - run: cp README.md release/SryzaMC/README.md && cp LICENSE release/SryzaMC/LICENSE
+      - run: cd release && zip -r SryzaMC-${GITHUB_REF_NAME}.zip SryzaMC
       - uses: softprops/action-gh-release@v2
         with:
-          files: target/${{ matrix.target }}/release/sryzamc${{ runner.os == 'Windows' && '.exe' || '' }}
+          files: |
+            release/SryzaMC/server.jar
+            release/SryzaMC-${{ github.ref_name }}.zip

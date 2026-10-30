@@ -2,6 +2,7 @@
 /server/
 /world/
 /plugins/*.jar
+/libraries/native/
 /logs/
 /backups/
 *.profraw

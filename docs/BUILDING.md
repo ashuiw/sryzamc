@@ -23,4 +23,4 @@ The Rust server itself does not currently require Java. JNI integration and Java
 
 ## Future JVM bridge
 
-The selected bridge baseline is JDK 25 or newer. Paper lists Java 25 for Minecraft 26.1 and later ([Paper requirements](https://docs.papermc.io/paper/getting-started/)). Building the planned shims will require the JDK compiler and JNI headers; running the bridge will require a compatible Java 25+ JVM. This is a target requirement for future bridge code, not a current runtime dependency.
+The Pterodactyl launcher is compiled for Java 25 bytecode. Paper lists Java 25 for Minecraft 26.1 and later ([Paper requirements](https://docs.papermc.io/paper/getting-started/)). Building the planned JNI compatibility shims will also require the JDK compiler and JNI headers; running the bridge will require a compatible Java 25+ JVM. The current Rust server binary itself has no Java dependency.

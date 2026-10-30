@@ -10,6 +10,10 @@ Bukkit/Spigot/Paper plugins are JVM bytecode linked against large Java APIs and 
 
 See [build requirements](docs/BUILDING.md) for Rust/MSVC setup and the future JVM bridge baseline. Windows MSVC compilation and the current test suite pass. No real Minecraft client verification has been performed.
 
+The release build includes a Java 25 launcher JAR for Pterodactyl; see [Pterodactyl deployment](docs/PTERODACTYL.md). Local smoke-test JARs can be built from available natives, but a partial-native JAR is not a deployable release.
+
+The current complete three-platform development package is at `dist/SryzaMC/server.jar` (also archived as `dist/SryzaMC-0.1.0-dev.zip`). It starts the Rust engine through Java, initializes missing defaults, verifies/extracts the native engine, and handles Pterodactyl-style SIGTERM shutdown. It is still not playable: after Configuration the engine closes the connection because Play and world spawning have not been implemented.
+
 ```text
 sryzamc --dir ./server init
 sryzamc --dir ./server info

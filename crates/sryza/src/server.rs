@@ -11,6 +11,7 @@ use std::{net::IpAddr, path::Path, sync::Arc, time::Duration};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Semaphore,
+    task::JoinSet,
 };
 use tracing::{info, warn};
 
@@ -30,24 +31,58 @@ pub async fn run(root: &Path) -> Result<()> {
     let slots = Arc::new(Semaphore::new(cfg.resources.max_packet_queue as usize));
     info!(address = %cfg.network.listen, version = GAME_VERSION, "SryzaMC accepting status, ping, and guarded login connections");
     tokio::spawn(TickScheduler::new(cfg.performance.target_tps).run_clock());
+    let mut connections = JoinSet::new();
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let permit = match slots.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => {
-                warn!(%peer, "connection queue full");
-                continue;
+        tokio::select! {
+            _ = &mut shutdown => {
+                info!("shutdown signal received; stopping listener");
+                break;
             }
-        };
-        let config = cfg.clone();
-        let identity = identity.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(error) = handle(stream, &config, identity.as_deref(), Some(peer.ip())).await
-            {
-                warn!(%peer, %error, "connection closed");
+            result = listener.accept() => {
+                let (stream, peer) = result?;
+                let permit = match slots.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!(%peer, "connection queue full");
+                        continue;
+                    }
+                };
+                let config = cfg.clone();
+                let identity = identity.clone();
+                connections.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle(stream, &config, identity.as_deref(), Some(peer.ip())).await {
+                        warn!(%peer, %error, "connection closed");
+                    }
+                });
             }
-        });
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    warn!(%error, "connection task failed");
+                }
+            }
+        }
+    }
+    connections.shutdown().await;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("register SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
