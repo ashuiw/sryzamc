@@ -14,7 +14,7 @@
 | `permissions` | `default_group`, `op_level` | Permission system absent. |
 | `commands` | `prefix`, `confirm_destructive` | Command system absent. |
 | `logging` | `level`, `directory`, `json` | `RUST_LOG` controls tracing level; file logging absent. |
-| `security` | `proxy_protocol`, `max_connections_per_ip`, `enforce_authentication` | Authentication, proxy and per-IP limit absent. |
+| `security` | `proxy_protocol`, `max_connections_per_ip`, `enforce_authentication`, `auth_timeout_seconds` | Session-server verification is used for online login; proxy and per-IP limits are absent. |
 | `backup` | `enabled`, `interval_minutes`, `retain`, `directory` | Backup system absent. |
 | `resources` | `max_open_files`, `max_pending_chunks`, `max_packet_queue` | Only connection handler concurrency is currently bounded. |
 | `monitoring` | `metrics`, `bind`, `debug_commands` | Metrics absent. |

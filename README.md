@@ -1,6 +1,6 @@
 # SryzaMC
 
-SryzaMC is an independent Rust Minecraft Java Edition server project. The current executable accepts Minecraft handshake connections and implements status/ping for protocol 777 (26.3). With `online_mode = false`, it performs the offline Login exchange and then disconnects at Configuration because registry synchronization is not implemented. With secure default `online_mode = true`, it rejects login because encryption and Mojang verification are not integrated yet. Players cannot join a world. No Bukkit, Spigot, or Paper plugin compatibility is claimed.
+SryzaMC is an independent Rust Minecraft Java Edition server project. The code implements status/ping and protocol 777 (26.3) Login in online and offline modes, including online Mojang session verification, encryption, compression, known-pack negotiation, vanilla feature flags, tags, a validated Configuration Keep Alive, and the Configuration acknowledgement. After Configuration it currently closes the connection because Play/world spawning is not implemented. No Bukkit, Spigot, or Paper plugin compatibility is claimed.
 
 ## Java plugin compatibility
 
@@ -8,7 +8,7 @@ Bukkit/Spigot/Paper plugins are JVM bytecode linked against large Java APIs and 
 
 ## Build and run
 
-Install Rust stable (edition 2021), then run `cargo build --release --workspace`. Use `cargo test --workspace` and `cargo bench -p sryzamc --bench scheduler` when changing code. Rust/Cargo are not installed in the current environment, so these commands have not been verified here.
+See [build requirements](docs/BUILDING.md) for Rust/MSVC setup and the future JVM bridge baseline. Windows MSVC compilation and the current test suite pass. No real Minecraft client verification has been performed.
 
 ```text
 sryzamc --dir ./server init
@@ -16,7 +16,7 @@ sryzamc --dir ./server info
 sryzamc --dir ./server run
 ```
 
-Status and ping work for protocol 777 (26.3); login is not implemented, so players cannot join yet. See [configuration reference](docs/CONFIGURATION.md) and [compatibility contract](docs/COMPATIBILITY.md).
+Status/ping, online/offline Login, and the Configuration packet exchange exist for protocol 777 (26.3), but Play and world spawning are incomplete and players cannot join a world yet. See [configuration reference](docs/CONFIGURATION.md) and [compatibility contract](docs/COMPATIBILITY.md).
 
 ## Layout
 

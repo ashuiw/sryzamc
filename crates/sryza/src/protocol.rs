@@ -1,3 +1,7 @@
+use aes::{
+    cipher::{BlockEncrypt, KeyInit},
+    Aes128,
+};
 use anyhow::{bail, ensure, Result};
 use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use md5::{Digest, Md5};
@@ -6,6 +10,51 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const PROTOCOL_VERSION: i32 = 777;
 pub const GAME_VERSION: &str = "26.3";
+
+/// Persistent AES/CFB8 state; Minecraft uses the negotiated shared secret as both key and IV.
+pub struct MinecraftCipher {
+    aes: Aes128,
+    feedback: [u8; 16],
+}
+
+impl MinecraftCipher {
+    pub fn new(secret: &[u8]) -> Result<Self> {
+        Self::new_with_iv(secret, secret)
+    }
+
+    pub fn new_with_iv(secret: &[u8], iv: &[u8]) -> Result<Self> {
+        ensure!(secret.len() == 16, "AES shared secret must be 16 bytes");
+        ensure!(iv.len() == 16, "AES CFB8 IV must be 16 bytes");
+        let aes = Aes128::new_from_slice(secret)?;
+        let mut feedback = [0; 16];
+        feedback.copy_from_slice(iv);
+        Ok(Self { aes, feedback })
+    }
+
+    pub fn encrypt(&mut self, bytes: &mut [u8]) {
+        for byte in bytes {
+            let mut block = aes::cipher::Block::<Aes128>::default();
+            block.copy_from_slice(&self.feedback);
+            self.aes.encrypt_block(&mut block);
+            let encrypted = *byte ^ block[0];
+            self.feedback.copy_within(1.., 0);
+            self.feedback[15] = encrypted;
+            *byte = encrypted;
+        }
+    }
+
+    pub fn decrypt(&mut self, bytes: &mut [u8]) {
+        for byte in bytes {
+            let encrypted = *byte;
+            let mut block = aes::cipher::Block::<Aes128>::default();
+            block.copy_from_slice(&self.feedback);
+            self.aes.encrypt_block(&mut block);
+            *byte = encrypted ^ block[0];
+            self.feedback.copy_within(1.., 0);
+            self.feedback[15] = encrypted;
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginStart {
@@ -36,7 +85,11 @@ impl LoginStart {
         );
         let username = take_string(packet, &mut offset, 64)?;
         ensure!(
-            !username.is_empty() && username.chars().count() <= 16,
+            !username.is_empty()
+                && username.len() <= 16
+                && username
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
             "invalid player name"
         );
         let end = offset
@@ -168,16 +221,60 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(stream: &mut W, payload: &[u8]) 
     Ok(())
 }
 
+pub async fn read_wire_frame<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    max: usize,
+    cipher: &mut MinecraftCipher,
+) -> Result<Vec<u8>> {
+    let mut prefix = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).await?;
+        cipher.decrypt(&mut byte);
+        prefix.push(byte[0]);
+        if byte[0] & 0x80 == 0 {
+            break;
+        }
+    }
+    let (length, used) = decode_varint(&prefix)?;
+    ensure!(
+        used == prefix.len() && length >= 0 && length as usize <= max,
+        "invalid encrypted frame length"
+    );
+    let mut frame = vec![0; length as usize];
+    stream.read_exact(&mut frame).await?;
+    cipher.decrypt(&mut frame);
+    Ok(frame)
+}
+
+pub async fn write_wire_frame<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    payload: &[u8],
+    cipher: &mut MinecraftCipher,
+) -> Result<()> {
+    let mut frame = encode_varint(i32::try_from(payload.len())?);
+    frame.extend_from_slice(payload);
+    cipher.encrypt(&mut frame);
+    stream.write_all(&frame).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 /// Read one Minecraft frame after Set Compression has taken effect.
 /// Both the outer frame and advertised decompressed length are bounded by `max`.
+#[cfg(test)]
 pub async fn read_compressed_frame<R: AsyncRead + Unpin>(
     stream: &mut R,
     max: usize,
     threshold: i32,
 ) -> Result<Vec<u8>> {
     let frame = read_frame(stream, max).await?;
+    decode_compressed_payload(&frame, max, threshold)
+}
+
+pub fn decode_compressed_payload(frame: &[u8], max: usize, threshold: i32) -> Result<Vec<u8>> {
     let mut offset = 0;
-    let data_length = take_varint(&frame, &mut offset)?;
+    let data_length = take_varint(frame, &mut offset)?;
     ensure!(
         data_length >= 0 && data_length as usize <= max,
         "invalid decompressed frame length"
@@ -194,7 +291,7 @@ pub async fn read_compressed_frame<R: AsyncRead + Unpin>(
         threshold < 0 || data_length >= threshold,
         "compressed packet is below compression threshold"
     );
-    let mut decoder = ZlibDecoder::new(body);
+    let decoder = ZlibDecoder::new(body);
     let mut decoded = Vec::with_capacity(data_length as usize);
     decoder
         .take(data_length as u64 + 1)
@@ -206,12 +303,29 @@ pub async fn read_compressed_frame<R: AsyncRead + Unpin>(
     Ok(decoded)
 }
 
+#[cfg(test)]
+pub async fn read_compressed_wire_frame<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    max: usize,
+    threshold: i32,
+    cipher: &mut MinecraftCipher,
+) -> Result<Vec<u8>> {
+    let frame = read_wire_frame(stream, max, cipher).await?;
+    decode_compressed_payload(&frame, max, threshold)
+}
+
 /// Write one packet using the negotiated Minecraft compression framing.
+#[cfg(test)]
 pub async fn write_compressed_frame<W: AsyncWrite + Unpin>(
     stream: &mut W,
     packet: &[u8],
     threshold: i32,
 ) -> Result<()> {
+    let framed = encode_compressed_payload(packet, threshold)?;
+    write_frame(stream, &framed).await
+}
+
+pub fn encode_compressed_payload(packet: &[u8], threshold: i32) -> Result<Vec<u8>> {
     let mut framed = Vec::new();
     if threshold >= 0 && packet.len() >= threshold as usize {
         framed.extend(encode_varint(i32::try_from(packet.len())?));
@@ -222,7 +336,18 @@ pub async fn write_compressed_frame<W: AsyncWrite + Unpin>(
         framed.push(0);
         framed.extend_from_slice(packet);
     }
-    write_frame(stream, &framed).await
+    Ok(framed)
+}
+
+#[cfg(test)]
+pub async fn write_compressed_wire_frame<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    packet: &[u8],
+    threshold: i32,
+    cipher: &mut MinecraftCipher,
+) -> Result<()> {
+    let framed = encode_compressed_payload(packet, threshold)?;
+    write_wire_frame(stream, &framed, cipher).await
 }
 
 #[cfg(test)]
@@ -292,6 +417,40 @@ mod tests {
         let packet = encode_login_success(&profile, &session).unwrap();
         assert_eq!(decode_varint(&packet).unwrap(), (2, 1));
         assert!(packet.ends_with(&session));
+    }
+
+    #[test]
+    fn cfb8_cipher_state_continues_across_packet_fragments() {
+        let secret = [0x42; 16];
+        let mut encryptor = MinecraftCipher::new(&secret).unwrap();
+        let mut decryptor = MinecraftCipher::new(&secret).unwrap();
+        let first = b"frame length";
+        let second = b" then packet body";
+        let mut encrypted_first = first.to_vec();
+        let mut encrypted_second = second.to_vec();
+        encryptor.encrypt(&mut encrypted_first);
+        encryptor.encrypt(&mut encrypted_second);
+        decryptor.decrypt(&mut encrypted_first);
+        decryptor.decrypt(&mut encrypted_second);
+        assert_eq!(encrypted_first, first);
+        assert_eq!(encrypted_second, second);
+    }
+
+    #[test]
+    fn cfb8_matches_rustcrypto_reference_vector() {
+        let plaintext = b"hello world! this is my plaintext.";
+        let expected = [
+            0x33, 0xb3, 0x56, 0xce, 0x91, 0x84, 0x29, 0x0c, 0x4c, 0x8f, 0xac, 0xc1, 0xc0, 0xb1,
+            0xf9, 0x18, 0xd5, 0x47, 0x5a, 0xeb, 0x75, 0xb8, 0x8c, 0x16, 0x1c, 0xa6, 0x5b, 0xdf,
+            0x05, 0xc7, 0x13, 0x7f, 0xf4, 0xb0,
+        ];
+        let mut cipher = MinecraftCipher::new_with_iv(&[0x42; 16], &[0x24; 16]).unwrap();
+        let mut ciphertext = plaintext.to_vec();
+        cipher.encrypt(&mut ciphertext);
+        assert_eq!(ciphertext, expected);
+        let mut decryptor = MinecraftCipher::new_with_iv(&[0x42; 16], &[0x24; 16]).unwrap();
+        decryptor.decrypt(&mut ciphertext);
+        assert_eq!(ciphertext, plaintext);
     }
 
     #[tokio::test]

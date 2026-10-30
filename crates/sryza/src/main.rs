@@ -1,5 +1,6 @@
 mod authentication;
 mod config;
+mod configuration;
 mod protocol;
 mod scheduler;
 mod server;

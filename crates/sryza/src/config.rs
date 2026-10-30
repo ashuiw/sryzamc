@@ -85,6 +85,7 @@ pub struct SecurityConfig {
     pub proxy_protocol: bool,
     pub max_connections_per_ip: u16,
     pub enforce_authentication: bool,
+    pub auth_timeout_seconds: u32,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupConfig {
@@ -140,7 +141,7 @@ impl Default for Config {
             runtime: RuntimeConfig {
                 java_bridge: false,
                 java_executable: "java".into(),
-                plugin_api: "paper-1.21".into(),
+                plugin_api: "paper-26.3".into(),
             },
             plugins: PluginConfig {
                 directory: "plugins".into(),
@@ -164,6 +165,7 @@ impl Default for Config {
                 proxy_protocol: false,
                 max_connections_per_ip: 5,
                 enforce_authentication: true,
+                auth_timeout_seconds: 30,
             },
             backup: BackupConfig {
                 enabled: false,
@@ -213,6 +215,14 @@ pub fn load(root: &Path) -> Result<Config> {
     anyhow::ensure!(
         c.network.max_packet_bytes >= 1024,
         "max_packet_bytes must be at least 1024"
+    );
+    anyhow::ensure!(
+        (1..=300).contains(&c.security.auth_timeout_seconds),
+        "security.auth_timeout_seconds must be 1..=300"
+    );
+    anyhow::ensure!(
+        !c.server.online_mode || c.security.enforce_authentication,
+        "online_mode requires security.enforce_authentication = true"
     );
     Ok(c)
 }

@@ -20,6 +20,7 @@ impl PartialOrd for Scheduled {
 pub struct TickScheduler {
     tick: u64,
     tasks: BinaryHeap<Scheduled>,
+    #[cfg(test)]
     next_id: u64,
     period: Duration,
 }
@@ -28,10 +29,12 @@ impl TickScheduler {
         Self {
             tick: 0,
             tasks: BinaryHeap::new(),
+            #[cfg(test)]
             next_id: 0,
             period: Duration::from_nanos(1_000_000_000 / u64::from(tps.max(1))),
         }
     }
+    #[cfg(test)]
     pub fn schedule_after(&mut self, delay: u64) -> u64 {
         let id = self.next_id;
         self.next_id += 1;

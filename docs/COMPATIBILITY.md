@@ -2,6 +2,8 @@
 
 The goal is running Bukkit, Spigot, and Paper plugins without edits. **No plugin runs on this build.** There is no JVM, API classes, plugin descriptor scanner, classloader, lifecycle, scheduler integration, event dispatcher, command map, permission service, or CraftBukkit/Paper implementation.
 
+The selected protocol target is Java Edition 26.3. A future bridge should use **JDK 25 or newer** to build the Java shims and **Java 25 or newer** at runtime. Paper's current runtime matrix lists Java 25 for Minecraft 26.1 and later ([Paper requirements](https://docs.papermc.io/paper/getting-started/)). This is a compatibility target, not evidence that the current Rust-only executable needs Java.
+
 ## Bridge work required
 
 1. Select a Java baseline and concrete API release.

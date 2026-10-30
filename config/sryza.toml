@@ -2,7 +2,7 @@
 [server]
 motd = "A SryzaMC server" # Server-list status text.
 max_players = 20 # Maximum simultaneous players.
-online_mode = true # Secure default. Online auth currently rejects logins; false permits offline login only, then disconnects at Configuration.
+online_mode = true # Secure default; online login verifies the Mojang session. Set false for private/offline servers.
 view_distance = 10 # Planned chunk send radius in chunks.
 simulation_distance = 8 # Planned simulation radius in chunks.
 [performance]
@@ -26,7 +26,7 @@ compression_threshold = 256 # Planned protocol compression threshold.
 [runtime]
 java_bridge = false # No bridge exists. Enabling this has no effect.
 java_executable = "java" # Planned bridge JVM executable.
-plugin_api = "paper-1.21" # Planned target only; API is absent.
+plugin_api = "paper-26.3" # Planned target only; API is absent.
 [plugins]
 directory = "plugins" # Planned JAR folder.
 allowlist_only = true # Safe default for future arbitrary code execution.
@@ -44,7 +44,8 @@ json = false # Planned structured file output.
 [security]
 proxy_protocol = false # Proxy header support is absent.
 max_connections_per_ip = 5 # Planned per-address connection cap.
-enforce_authentication = true # Authentication is absent despite this future policy default.
+enforce_authentication = true # Require Mojang session verification whenever online_mode is enabled.
+auth_timeout_seconds = 30 # Login Start and authentication request timeout, 1..=300.
 [backup]
 enabled = false # Backups are not implemented.
 interval_minutes = 60 # Planned snapshot cadence.

@@ -1,10 +1,137 @@
 use crate::protocol::{GameProfile, ProfileProperty};
 use anyhow::{bail, ensure, Context, Result};
+use rand::rngs::OsRng;
+use rsa::{
+    pkcs1v15::Pkcs1v15Encrypt,
+    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
+    RsaPrivateKey, RsaPublicKey,
+};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::net::IpAddr;
 
 const SESSION_URL: &str = "https://sessionserver.mojang.com/session/minecraft/hasJoined";
+
+pub struct ServerIdentity {
+    private_key: RsaPrivateKey,
+    public_key_der: Vec<u8>,
+    http: reqwest::Client,
+    session_url: String,
+}
+
+impl ServerIdentity {
+    /// Load the persistent Minecraft RSA identity or create it on first startup.
+    pub fn load_or_create(path: &std::path::Path) -> Result<Self> {
+        Self::load_or_create_at(path, SESSION_URL)
+    }
+
+    pub fn load_or_create_at(
+        path: &std::path::Path,
+        session_url: impl Into<String>,
+    ) -> Result<Self> {
+        let private_key = if path.exists() {
+            RsaPrivateKey::from_pkcs8_der(&std::fs::read(path).context("read server RSA key")?)
+                .context("decode server RSA key")?
+        } else {
+            let key = RsaPrivateKey::new(&mut OsRng, 1024).context("generate Minecraft RSA key")?;
+            let der = key.to_pkcs8_der().context("encode server RSA key")?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, der.as_bytes()).context("persist server RSA key")?;
+            key
+        };
+        let public_key_der = RsaPublicKey::from(&private_key)
+            .to_public_key_der()
+            .context("encode server public key")?
+            .as_bytes()
+            .to_vec();
+        Ok(Self {
+            private_key,
+            public_key_der,
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+            session_url: session_url.into(),
+        })
+    }
+
+    pub fn encryption_request(&self, verify_token: &[u8]) -> Result<Vec<u8>> {
+        let mut packet = crate::protocol::encode_varint(1);
+        crate::protocol::put_string("", &mut packet)?;
+        put_byte_array(&self.public_key_der, &mut packet)?;
+        put_byte_array(verify_token, &mut packet)?;
+        packet.push(1); // shouldAuthenticate: vanilla client performs session join
+        Ok(packet)
+    }
+
+    pub fn decrypt_encryption_response(
+        &self,
+        packet: &[u8],
+        expected_token: &[u8],
+    ) -> Result<[u8; 16]> {
+        let mut offset = 0;
+        ensure!(
+            crate::protocol::take_varint(packet, &mut offset)? == 1,
+            "expected Encryption Response"
+        );
+        let encrypted_secret = take_byte_array(packet, &mut offset, 512)?;
+        let encrypted_token = take_byte_array(packet, &mut offset, 512)?;
+        ensure!(
+            offset == packet.len(),
+            "unexpected trailing Encryption Response bytes"
+        );
+        let secret = self
+            .private_key
+            .decrypt(Pkcs1v15Encrypt, &encrypted_secret)
+            .context("decrypt shared secret")?;
+        let token = self
+            .private_key
+            .decrypt(Pkcs1v15Encrypt, &encrypted_token)
+            .context("decrypt verify token")?;
+        use subtle::ConstantTimeEq as _;
+        ensure!(
+            token.len() == expected_token.len()
+                && bool::from(token.as_slice().ct_eq(expected_token)),
+            "invalid encryption verify token"
+        );
+        ensure!(secret.len() == 16, "invalid AES shared secret length");
+        Ok(secret.try_into().expect("validated 16-byte secret"))
+    }
+
+    pub async fn verify(
+        &self,
+        username: &str,
+        shared_secret: &[u8],
+        ip: Option<IpAddr>,
+    ) -> Result<GameProfile> {
+        let hash = minecraft_server_hash(b"", shared_secret, &self.public_key_der);
+        verify_joined_profile_at(&self.http, &self.session_url, username, &hash, ip).await
+    }
+}
+
+fn put_byte_array(bytes: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    out.extend(crate::protocol::encode_varint(i32::try_from(bytes.len())?));
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn take_byte_array(data: &[u8], offset: &mut usize, max: usize) -> Result<Vec<u8>> {
+    let length = crate::protocol::take_varint(data, offset)?;
+    ensure!(
+        length >= 0 && length as usize <= max,
+        "invalid byte array length"
+    );
+    let end = offset
+        .checked_add(length as usize)
+        .context("byte array length overflow")?;
+    let bytes = data
+        .get(*offset..end)
+        .context("truncated byte array")?
+        .to_vec();
+    *offset = end;
+    Ok(bytes)
+}
 
 #[derive(Debug, Deserialize)]
 struct SessionProperty {
@@ -72,10 +199,9 @@ fn signed_hex(digest: &[u8]) -> String {
     }
 }
 
-/// Verify a client that has completed the encrypted session join against Mojang.
-/// This function must only be called after decrypting and validating the encryption response.
-pub async fn verify_joined_profile(
+async fn verify_joined_profile_at(
     client: &reqwest::Client,
+    session_url: &str,
     username: &str,
     server_hash: &str,
     client_ip: Option<IpAddr>,
@@ -85,7 +211,7 @@ pub async fn verify_joined_profile(
         "invalid player name"
     );
     let mut request = client
-        .get(SESSION_URL)
+        .get(session_url)
         .query(&[("username", username), ("serverId", server_hash)]);
     if let Some(ip) = client_ip {
         request = request.query(&[("ip", ip.to_string())]);
@@ -112,7 +238,7 @@ pub async fn verify_joined_profile(
         joined.properties.len() <= 16,
         "Mojang returned too many profile properties"
     );
-    let uuid_text = if joined.id.len() == 32 {
+    let uuid_text = if joined.id.len() == 32 && joined.id.is_ascii() {
         format!(
             "{}-{}-{}-{}-{}",
             &joined.id[0..8],

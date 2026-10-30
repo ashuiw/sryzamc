@@ -1,11 +1,13 @@
 use crate::{
-    config,
+    authentication::ServerIdentity,
+    config, configuration,
     protocol::{self, take_string, take_varint, GAME_VERSION, PROTOCOL_VERSION},
     scheduler::TickScheduler,
 };
 use anyhow::{ensure, Context, Result};
+use rand::RngCore;
 use serde_json::json;
-use std::{path::Path, sync::Arc};
+use std::{net::IpAddr, path::Path, sync::Arc, time::Duration};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Semaphore,
@@ -17,6 +19,13 @@ const LOGIN_STATE: i32 = 2;
 
 pub async fn run(root: &Path) -> Result<()> {
     let cfg = config::load(root)?;
+    let identity = if cfg.server.online_mode {
+        Some(Arc::new(ServerIdentity::load_or_create(
+            &root.join("config").join("server-key.pk8"),
+        )?))
+    } else {
+        None
+    };
     let listener = TcpListener::bind(cfg.network.listen).await?;
     let slots = Arc::new(Semaphore::new(cfg.resources.max_packet_queue as usize));
     info!(address = %cfg.network.listen, version = GAME_VERSION, "SryzaMC accepting status, ping, and guarded login connections");
@@ -31,16 +40,23 @@ pub async fn run(root: &Path) -> Result<()> {
             }
         };
         let config = cfg.clone();
+        let identity = identity.clone();
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(error) = handle(stream, &config).await {
+            if let Err(error) = handle(stream, &config, identity.as_deref(), Some(peer.ip())).await
+            {
                 warn!(%peer, %error, "connection closed");
             }
         });
     }
 }
 
-async fn handle(mut stream: TcpStream, config: &config::Config) -> Result<()> {
+async fn handle(
+    mut stream: TcpStream,
+    config: &config::Config,
+    identity: Option<&ServerIdentity>,
+    remote_ip: Option<IpAddr>,
+) -> Result<()> {
     let max = config.network.max_packet_bytes;
     let handshake = protocol::read_frame(&mut stream, max)
         .await
@@ -71,7 +87,17 @@ async fn handle(mut stream: TcpStream, config: &config::Config) -> Result<()> {
 
     match next_state {
         STATUS_STATE => status_session(&mut stream, config, max).await,
-        LOGIN_STATE => login_session(&mut stream, config, max, client_protocol).await,
+        LOGIN_STATE => {
+            login_session(
+                &mut stream,
+                config,
+                max,
+                client_protocol,
+                identity,
+                remote_ip,
+            )
+            .await
+        }
         other => anyhow::bail!("unsupported handshake intent {other}"),
     }
 }
@@ -81,31 +107,60 @@ async fn login_session(
     config: &config::Config,
     max: usize,
     client_protocol: i32,
+    identity: Option<&ServerIdentity>,
+    remote_ip: Option<IpAddr>,
 ) -> Result<()> {
     ensure!(
         client_protocol == PROTOCOL_VERSION,
         "login protocol mismatch: expected {PROTOCOL_VERSION}, got {client_protocol}"
     );
-    let start_packet = protocol::read_frame(stream, max)
-        .await
-        .context("read Login Start")?;
+    let start_packet = tokio::time::timeout(
+        Duration::from_secs(config.security.auth_timeout_seconds.max(1) as u64),
+        protocol::read_frame(stream, max),
+    )
+    .await
+    .context("Login Start timed out")?
+    .context("read Login Start")?;
     let login = protocol::LoginStart::decode(&start_packet)?;
 
-    if config.server.online_mode {
-        send_disconnect(
-            stream,
-            0,
-            "Online authentication is not implemented yet; no login was accepted.",
+    let mut send_cipher = None;
+    let mut receive_cipher = None;
+    let profile = if config.server.online_mode {
+        let identity = identity.context("online mode requires a persistent RSA identity")?;
+        let mut verify_token = [0u8; 4];
+        rand::rngs::OsRng.fill_bytes(&mut verify_token);
+        let request = identity.encryption_request(&verify_token)?;
+        protocol::write_frame(stream, &request)
+            .await
+            .context("send Encryption Request")?;
+        let key_response = tokio::time::timeout(
+            Duration::from_secs(config.security.auth_timeout_seconds.max(1) as u64),
+            protocol::read_frame(stream, max),
         )
-        .await?;
-        warn!(player = %login.username, "rejected login because online authentication is unavailable");
-        return Ok(());
-    }
-
-    let profile = protocol::GameProfile {
-        uuid: protocol::offline_uuid(&login.username),
-        username: login.username.clone(),
-        properties: Vec::new(),
+        .await
+        .context("Encryption Response timed out")?
+        .context("read Encryption Response")?;
+        let secret = identity.decrypt_encryption_response(&key_response, &verify_token)?;
+        send_cipher = Some(protocol::MinecraftCipher::new(&secret)?);
+        receive_cipher = Some(protocol::MinecraftCipher::new(&secret)?);
+        match identity.verify(&login.username, &secret, remote_ip).await {
+            Ok(profile) => profile,
+            Err(error) => {
+                let mut packet = protocol::encode_varint(0);
+                protocol::put_string(
+                    &json!({"text":"Minecraft account verification failed."}).to_string(),
+                    &mut packet,
+                )?;
+                protocol::write_wire_frame(stream, &packet, send_cipher.as_mut().unwrap()).await?;
+                return Err(error).context("verify authenticated Minecraft account");
+            }
+        }
+    } else {
+        protocol::GameProfile {
+            uuid: protocol::offline_uuid(&login.username),
+            username: login.username.clone(),
+            properties: Vec::new(),
+        }
     };
     let session_id = *uuid::Uuid::new_v4().as_bytes();
     let threshold = config.network.compression_threshold;
@@ -114,31 +169,29 @@ async fn login_session(
     if compression_enabled {
         let mut set_compression = protocol::encode_varint(3);
         set_compression.extend(protocol::encode_varint(threshold));
-        protocol::write_frame(stream, &set_compression)
+        write_connection_packet(stream, &set_compression, send_cipher.as_mut(), None)
             .await
             .context("send Set Compression")?;
     }
 
     let login_success = protocol::encode_login_success(&profile, &session_id)?;
-    if compression_enabled {
-        protocol::write_compressed_frame(stream, &login_success, threshold)
-            .await
-            .context("send Login Success")?;
-    } else {
-        protocol::write_frame(stream, &login_success)
-            .await
-            .context("send Login Success")?;
-    }
+    write_connection_packet(
+        stream,
+        &login_success,
+        send_cipher.as_mut(),
+        compression_enabled.then_some(threshold),
+    )
+    .await
+    .context("send Login Success")?;
 
-    let acknowledgement = if compression_enabled {
-        protocol::read_compressed_frame(stream, max, threshold)
-            .await
-            .context("read Login Acknowledged")?
-    } else {
-        protocol::read_frame(stream, max)
-            .await
-            .context("read Login Acknowledged")?
-    };
+    let acknowledgement = read_connection_packet(
+        stream,
+        max,
+        receive_cipher.as_mut(),
+        compression_enabled.then_some(threshold),
+    )
+    .await
+    .context("read Login Acknowledged")?;
     let mut offset = 0;
     ensure!(
         protocol::take_varint(&acknowledgement, &mut offset)? == 3
@@ -146,29 +199,134 @@ async fn login_session(
         "expected Login Acknowledged"
     );
 
-    // Do not leave a client hanging or claim Play support before registry synchronization exists.
-    let mut config_disconnect = protocol::encode_varint(2);
-    protocol::put_string(
-        &json!({ "text": "Login completed in offline mode, but Configuration registry synchronization is not implemented yet." }).to_string(),
-        &mut config_disconnect,
-    )?;
-    if compression_enabled {
-        protocol::write_compressed_frame(stream, &config_disconnect, threshold)
-            .await
-            .context("send Configuration Disconnect")?;
-    } else {
-        protocol::write_frame(stream, &config_disconnect)
-            .await
-            .context("send Configuration Disconnect")?;
-    }
-    info!(player = %profile.username, "completed offline Login state; configuration is not implemented");
+    configuration_session(
+        stream,
+        max,
+        config.security.auth_timeout_seconds,
+        send_cipher.as_mut(),
+        receive_cipher.as_mut(),
+        compression_enabled.then_some(threshold),
+    )
+    .await?;
+    info!(player = %profile.username, online_mode = config.server.online_mode, "completed Configuration state; Play world spawning is not implemented");
     Ok(())
 }
 
-async fn send_disconnect(stream: &mut TcpStream, packet_id: i32, reason: &str) -> Result<()> {
-    let mut packet = protocol::encode_varint(packet_id);
-    protocol::put_string(&json!({ "text": reason }).to_string(), &mut packet)?;
-    protocol::write_frame(stream, &packet).await
+#[allow(clippy::needless_option_as_deref, clippy::option_as_ref_deref)]
+async fn configuration_session(
+    stream: &mut TcpStream,
+    max: usize,
+    timeout_seconds: u32,
+    send_cipher: Option<&mut protocol::MinecraftCipher>,
+    receive_cipher: Option<&mut protocol::MinecraftCipher>,
+    compression: Option<i32>,
+) -> Result<()> {
+    let mut send_cipher = send_cipher;
+    let mut receive_cipher = receive_cipher;
+    write_connection_packet(
+        stream,
+        &configuration::select_known_packs(&[])?,
+        send_cipher.as_mut().map(|cipher| &mut **cipher),
+        compression,
+    )
+    .await
+    .context("send Select Known Packs")?;
+    let known_packs = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds.max(1) as u64),
+        read_connection_packet(
+            stream,
+            max,
+            receive_cipher.as_mut().map(|cipher| &mut **cipher),
+            compression,
+        ),
+    )
+    .await
+    .context("Select Known Packs response timed out")??;
+    let _client_packs = configuration::validate_known_packs_response(&known_packs)?;
+
+    let keep_alive_id = rand::rngs::OsRng.next_u64() as i64;
+    write_connection_packet(
+        stream,
+        &configuration::keep_alive(keep_alive_id),
+        send_cipher.as_deref_mut(),
+        compression,
+    )
+    .await
+    .context("send Configuration Keep Alive")?;
+    let keep_alive_response = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds.max(1) as u64),
+        read_connection_packet(stream, max, receive_cipher.as_deref_mut(), compression),
+    )
+    .await
+    .context("Configuration Keep Alive timed out")??;
+    configuration::validate_keep_alive(&keep_alive_response, keep_alive_id)
+        .context("validate Configuration Keep Alive")?;
+
+    write_connection_packet(
+        stream,
+        &configuration::update_enabled_features(&["minecraft:vanilla"])?,
+        send_cipher.as_deref_mut(),
+        compression,
+    )
+    .await
+    .context("send enabled feature flags")?;
+    write_connection_packet(
+        stream,
+        &configuration::update_tags_empty(),
+        send_cipher.as_deref_mut(),
+        compression,
+    )
+    .await
+    .context("send empty tag update")?;
+    write_connection_packet(
+        stream,
+        &configuration::finish_configuration(),
+        send_cipher.as_deref_mut(),
+        compression,
+    )
+    .await
+    .context("send Finish Configuration")?;
+    let finish_ack = tokio::time::timeout(
+        Duration::from_secs(timeout_seconds.max(1) as u64),
+        read_connection_packet(stream, max, receive_cipher.as_deref_mut(), compression),
+    )
+    .await
+    .context("Finish Configuration acknowledgement timed out")??;
+    configuration::validate_finish_acknowledgement(&finish_ack)
+        .context("validate Finish Configuration acknowledgement")?;
+    Ok(())
+}
+
+async fn read_connection_packet(
+    stream: &mut TcpStream,
+    max: usize,
+    cipher: Option<&mut protocol::MinecraftCipher>,
+    compression: Option<i32>,
+) -> Result<Vec<u8>> {
+    let frame = match cipher {
+        Some(cipher) => protocol::read_wire_frame(stream, max, cipher).await?,
+        None => protocol::read_frame(stream, max).await?,
+    };
+    match compression {
+        Some(threshold) => protocol::decode_compressed_payload(&frame, max, threshold),
+        None => Ok(frame),
+    }
+}
+
+async fn write_connection_packet(
+    stream: &mut TcpStream,
+    packet: &[u8],
+    cipher: Option<&mut protocol::MinecraftCipher>,
+    compression: Option<i32>,
+) -> Result<()> {
+    let frame_payload = match compression {
+        Some(threshold) => protocol::encode_compressed_payload(packet, threshold)?,
+        None => packet.to_vec(),
+    };
+    match cipher {
+        Some(cipher) => protocol::write_wire_frame(stream, &frame_payload, cipher).await,
+        None => protocol::write_frame(stream, &frame_payload).await,
+    }
 }
 
 async fn status_session(stream: &mut TcpStream, config: &config::Config, max: usize) -> Result<()> {
@@ -218,8 +376,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server_config = config.clone();
         let task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            handle(socket, &server_config).await.unwrap();
+            let (socket, _) = listener.accept().await.unwrap();
+            handle(socket, &server_config, None, None).await.unwrap();
         });
         let mut client = TcpStream::connect(address).await.unwrap();
 
@@ -253,7 +411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offline_login_uses_compression_then_disconnects_at_unimplemented_configuration() {
+    async fn offline_login_completes_configuration_state() {
         let mut config = config::Config::default();
         config.server.online_mode = false;
         config.network.compression_threshold = 1;
@@ -262,7 +420,7 @@ mod tests {
         let server_config = config.clone();
         let task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            handle(socket, &server_config).await.unwrap();
+            handle(socket, &server_config, None, None).await.unwrap();
         });
         let mut client = TcpStream::connect(address).await.unwrap();
 
@@ -309,26 +467,50 @@ mod tests {
         protocol::write_compressed_frame(&mut client, &ack, 1)
             .await
             .unwrap();
-        let disconnect = protocol::read_compressed_frame(&mut client, 4096, 1)
-            .await
-            .unwrap();
-        let (disconnect_id, mut offset) = protocol::decode_varint(&disconnect).unwrap();
-        assert_eq!(disconnect_id, 2);
-        let reason = protocol::take_string(&disconnect, &mut offset, 2048).unwrap();
-        assert!(reason.contains("Configuration registry synchronization is not implemented"));
+        assert_configuration_packets(&mut client, None, None, 1).await;
         task.await.unwrap();
     }
 
     #[tokio::test]
-    async fn online_mode_rejects_login_instead_of_accepting_an_unauthenticated_profile() {
-        let config = config::Config::default();
+    async fn online_login_verifies_mojang_profile_and_encrypts_connection() {
+        use rsa::{pkcs1v15::Pkcs1v15Encrypt, pkcs8::DecodePublicKey, RsaPublicKey};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mock_auth = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let auth_address = mock_auth.local_addr().unwrap();
+        let auth_task = tokio::spawn(async move {
+            let (mut socket, _) = mock_auth.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 8192);
+            }
+            let body =
+                r#"{"id":"00000000000000000000000000000001","name":"Notch","properties":[]}"#;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let key_path =
+            std::env::temp_dir().join(format!("sryzamc-test-{}.pk8", uuid::Uuid::new_v4()));
+        let identity = ServerIdentity::load_or_create_at(
+            &key_path,
+            format!("http://{auth_address}/hasJoined"),
+        )
+        .unwrap();
+        let mut config = config::Config::default();
+        config.network.compression_threshold = 1;
         assert!(config.server.online_mode);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server_config = config.clone();
         let task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            handle(socket, &server_config).await.unwrap();
+            handle(socket, &server_config, Some(&identity), None)
+                .await
+                .unwrap();
         });
         let mut client = TcpStream::connect(address).await.unwrap();
         let mut handshake = protocol::encode_varint(0);
@@ -346,11 +528,199 @@ mod tests {
             .await
             .unwrap();
 
-        let disconnect = protocol::read_frame(&mut client, 4096).await.unwrap();
-        let (id, mut offset) = protocol::decode_varint(&disconnect).unwrap();
-        assert_eq!(id, 0, "expected login disconnect, never Login Success");
-        let reason = protocol::take_string(&disconnect, &mut offset, 2048).unwrap();
-        assert!(reason.contains("Online authentication is not implemented"));
+        let encryption_request = protocol::read_frame(&mut client, 4096).await.unwrap();
+        let mut offset = 0;
+        assert_eq!(
+            protocol::take_varint(&encryption_request, &mut offset).unwrap(),
+            1
+        );
+        assert_eq!(
+            protocol::take_string(&encryption_request, &mut offset, 20).unwrap(),
+            ""
+        );
+        let public_key_der = take_test_bytes(&encryption_request, &mut offset);
+        let verify_token = take_test_bytes(&encryption_request, &mut offset);
+        assert_eq!(encryption_request[offset], 1);
+        let public_key = RsaPublicKey::from_public_key_der(&public_key_der).unwrap();
+        let secret = [0x33; 16];
+        let mut key_response = protocol::encode_varint(1);
+        put_test_bytes(
+            &public_key
+                .encrypt(&mut rand::rngs::OsRng, Pkcs1v15Encrypt, &secret)
+                .unwrap(),
+            &mut key_response,
+        );
+        put_test_bytes(
+            &public_key
+                .encrypt(&mut rand::rngs::OsRng, Pkcs1v15Encrypt, &verify_token)
+                .unwrap(),
+            &mut key_response,
+        );
+        protocol::write_frame(&mut client, &key_response)
+            .await
+            .unwrap();
+
+        let mut incoming_cipher = protocol::MinecraftCipher::new(&secret).unwrap();
+        let mut outgoing_cipher = protocol::MinecraftCipher::new(&secret).unwrap();
+        let set_compression = protocol::read_wire_frame(&mut client, 4096, &mut incoming_cipher)
+            .await
+            .unwrap();
+        let (packet_id, mut offset) = protocol::decode_varint(&set_compression).unwrap();
+        assert_eq!(packet_id, 3);
+        assert_eq!(
+            protocol::take_varint(&set_compression, &mut offset).unwrap(),
+            1
+        );
+
+        let login_success =
+            protocol::read_compressed_wire_frame(&mut client, 4096, 1, &mut incoming_cipher)
+                .await
+                .unwrap();
+        let (packet_id, mut offset) = protocol::decode_varint(&login_success).unwrap();
+        assert_eq!(packet_id, 2);
+        let profile_uuid: [u8; 16] = login_success[offset..offset + 16].try_into().unwrap();
+        offset += 16;
+        assert_eq!(
+            protocol::take_string(&login_success, &mut offset, 64).unwrap(),
+            "Notch"
+        );
+        assert_eq!(
+            profile_uuid,
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+                .unwrap()
+                .into_bytes()
+        );
+        let ack = protocol::encode_varint(3);
+        protocol::write_compressed_wire_frame(&mut client, &ack, 1, &mut outgoing_cipher)
+            .await
+            .unwrap();
+        assert_configuration_packets(
+            &mut client,
+            Some(&mut incoming_cipher),
+            Some(&mut outgoing_cipher),
+            1,
+        )
+        .await;
         task.await.unwrap();
+        auth_task.await.unwrap();
+        std::fs::remove_file(key_path).unwrap();
+    }
+
+    fn take_test_bytes(data: &[u8], offset: &mut usize) -> Vec<u8> {
+        let len = protocol::take_varint(data, offset).unwrap() as usize;
+        let bytes = data[*offset..*offset + len].to_vec();
+        *offset += len;
+        bytes
+    }
+
+    fn put_test_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+        out.extend(protocol::encode_varint(bytes.len() as i32));
+        out.extend_from_slice(bytes);
+    }
+
+    async fn assert_configuration_packets(
+        client: &mut TcpStream,
+        incoming_cipher: Option<&mut protocol::MinecraftCipher>,
+        outgoing_cipher: Option<&mut protocol::MinecraftCipher>,
+        compression: i32,
+    ) {
+        let mut incoming_cipher = incoming_cipher;
+        let mut outgoing_cipher = outgoing_cipher;
+        let selected = match incoming_cipher.as_deref_mut() {
+            Some(cipher) => protocol::read_compressed_wire_frame(client, 4096, compression, cipher)
+                .await
+                .unwrap(),
+            None => protocol::read_compressed_frame(client, 4096, compression)
+                .await
+                .unwrap(),
+        };
+        let mut offset = 0;
+        assert_eq!(protocol::take_varint(&selected, &mut offset).unwrap(), 15);
+        assert_eq!(protocol::take_varint(&selected, &mut offset).unwrap(), 0);
+        let known_packs = vec![7, 0];
+        match outgoing_cipher.as_deref_mut() {
+            Some(cipher) => {
+                protocol::write_compressed_wire_frame(client, &known_packs, compression, cipher)
+                    .await
+                    .unwrap()
+            }
+            None => protocol::write_compressed_frame(client, &known_packs, compression)
+                .await
+                .unwrap(),
+        }
+
+        let keep_alive = match incoming_cipher.as_deref_mut() {
+            Some(cipher) => protocol::read_compressed_wire_frame(client, 4096, compression, cipher)
+                .await
+                .unwrap(),
+            None => protocol::read_compressed_frame(client, 4096, compression)
+                .await
+                .unwrap(),
+        };
+        let (keep_alive_id, mut offset) = protocol::decode_varint(&keep_alive).unwrap();
+        assert_eq!(keep_alive_id, 4);
+        let token_bytes: [u8; 8] = keep_alive[offset..offset + 8].try_into().unwrap();
+        offset += 8;
+        assert_eq!(offset, keep_alive.len());
+        let mut keep_alive_response = protocol::encode_varint(4);
+        keep_alive_response.extend(token_bytes);
+        match outgoing_cipher.as_deref_mut() {
+            Some(cipher) => protocol::write_compressed_wire_frame(
+                client,
+                &keep_alive_response,
+                compression,
+                cipher,
+            )
+            .await
+            .unwrap(),
+            None => protocol::write_compressed_frame(client, &keep_alive_response, compression)
+                .await
+                .unwrap(),
+        }
+
+        let features = match incoming_cipher.as_deref_mut() {
+            Some(cipher) => protocol::read_compressed_wire_frame(client, 4096, compression, cipher)
+                .await
+                .unwrap(),
+            None => protocol::read_compressed_frame(client, 4096, compression)
+                .await
+                .unwrap(),
+        };
+        let mut offset = 0;
+        assert_eq!(protocol::take_varint(&features, &mut offset).unwrap(), 13);
+        assert_eq!(protocol::take_varint(&features, &mut offset).unwrap(), 1);
+        assert_eq!(
+            protocol::take_string(&features, &mut offset, 64).unwrap(),
+            "minecraft:vanilla"
+        );
+
+        let tags = match incoming_cipher.as_deref_mut() {
+            Some(cipher) => protocol::read_compressed_wire_frame(client, 4096, compression, cipher)
+                .await
+                .unwrap(),
+            None => protocol::read_compressed_frame(client, 4096, compression)
+                .await
+                .unwrap(),
+        };
+        assert_eq!(tags, [14, 0]);
+        let finish = match incoming_cipher {
+            Some(cipher) => protocol::read_compressed_wire_frame(client, 4096, compression, cipher)
+                .await
+                .unwrap(),
+            None => protocol::read_compressed_frame(client, 4096, compression)
+                .await
+                .unwrap(),
+        };
+        assert_eq!(finish, [3]);
+        match outgoing_cipher {
+            Some(cipher) => {
+                protocol::write_compressed_wire_frame(client, &[3], compression, cipher)
+                    .await
+                    .unwrap()
+            }
+            None => protocol::write_compressed_frame(client, &[3], compression)
+                .await
+                .unwrap(),
+        }
     }
 }
