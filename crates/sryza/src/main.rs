@@ -1,3 +1,4 @@
+mod authentication;
 mod config;
 mod protocol;
 mod scheduler;
@@ -34,7 +35,9 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
     let cli = Cli::parse();
     match cli.command {
@@ -42,7 +45,10 @@ async fn main() -> Result<()> {
         Command::Run | Command::Start => server::run(&cli.dir).await,
         Command::Migrate { source } => config::migration_report(&source, &cli.dir),
         Command::Info => {
-            println!("SryzaMC {} | Java Edition status protocol 777 (26.3)", env!("CARGO_PKG_VERSION"));
+            println!(
+                "SryzaMC {} | Java Edition status protocol 777 (26.3)",
+                env!("CARGO_PKG_VERSION")
+            );
             Ok(())
         }
     }

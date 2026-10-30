@@ -1,24 +1,271 @@
-use anyhow::{Context,Result}; use serde::{Deserialize,Serialize}; use std::{fs,net::SocketAddr,path::Path};
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct Config { pub server:ServerConfig,pub performance:PerformanceConfig,pub world:WorldConfig,pub entities:EntityConfig,pub network:NetworkConfig,pub runtime:RuntimeConfig,pub plugins:PluginConfig,pub permissions:PermissionConfig,pub commands:CommandConfig,pub logging:LoggingConfig,pub security:SecurityConfig,pub backup:BackupConfig,pub resources:ResourceConfig,pub monitoring:MonitoringConfig }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct ServerConfig { pub motd:String,pub max_players:u16,pub online_mode:bool,pub view_distance:u8,pub simulation_distance:u8 }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct PerformanceConfig { pub target_tps:u8,pub tick_budget_ms:u16,pub worker_threads:usize,pub async_chunk_io:bool }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct WorldConfig { pub name:String,pub seed:i64,pub autosave_seconds:u32,pub compression_level:u8 }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct EntityConfig { pub activation_range:u8,pub max_per_chunk:u16,pub tracking_range:u8 }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct NetworkConfig { pub listen:SocketAddr,pub max_packet_bytes:usize,pub compression_threshold:i32 }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct RuntimeConfig { pub java_bridge:bool,pub java_executable:String,pub plugin_api:String }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct PluginConfig { pub directory:String,pub allowlist_only:bool,pub load_timeout_seconds:u32 }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct PermissionConfig { pub default_group:String,pub op_level:u8 }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct CommandConfig { pub prefix:String,pub confirm_destructive:bool }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct LoggingConfig { pub level:String,pub directory:String,pub json:bool }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct SecurityConfig { pub proxy_protocol:bool,pub max_connections_per_ip:u16,pub enforce_authentication:bool }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct BackupConfig { pub enabled:bool,pub interval_minutes:u32,pub retain:u16,pub directory:String }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct ResourceConfig { pub max_open_files:u32,pub max_pending_chunks:u32,pub max_packet_queue:u32 }
-#[derive(Debug,Clone,Serialize,Deserialize)] pub struct MonitoringConfig { pub metrics:bool,pub bind:SocketAddr,pub debug_commands:bool }
-impl Default for Config { fn default()->Self {Self {
-server:ServerConfig{motd:"A SryzaMC server".into(),max_players:20,online_mode:true,view_distance:10,simulation_distance:8},
-performance:PerformanceConfig{target_tps:20,tick_budget_ms:50,worker_threads:0,async_chunk_io:true},world:WorldConfig{name:"world".into(),seed:0,autosave_seconds:300,compression_level:3},entities:EntityConfig{activation_range:32,max_per_chunk:70,tracking_range:10},network:NetworkConfig{listen:"0.0.0.0:25565".parse().unwrap(),max_packet_bytes:2097152,compression_threshold:256},runtime:RuntimeConfig{java_bridge:false,java_executable:"java".into(),plugin_api:"paper-1.21".into()},plugins:PluginConfig{directory:"plugins".into(),allowlist_only:true,load_timeout_seconds:30},permissions:PermissionConfig{default_group:"default".into(),op_level:4},commands:CommandConfig{prefix:"/".into(),confirm_destructive:true},logging:LoggingConfig{level:"info".into(),directory:"logs".into(),json:false},security:SecurityConfig{proxy_protocol:false,max_connections_per_ip:5,enforce_authentication:true},backup:BackupConfig{enabled:false,interval_minutes:60,retain:24,directory:"backups".into()},resources:ResourceConfig{max_open_files:4096,max_pending_chunks:512,max_packet_queue:4096},monitoring:MonitoringConfig{metrics:false,bind:"127.0.0.1:9100".parse().unwrap(),debug_commands:false}
-}} }
-pub fn initialize(root:&Path)->Result<()> {fs::create_dir_all(root)?;for d in ["world","plugins","logs","backups","config"]{fs::create_dir_all(root.join(d))?;}let path=root.join("sryza.toml");if path.exists(){anyhow::bail!("{} already exists; refusing to overwrite",path.display());}fs::write(path,include_str!("../../../config/sryza.toml"))?;let props=root.join("server.properties");if !props.exists(){fs::write(props,include_str!("../../../config/server.properties"))?;}println!("Initialized SryzaMC data directory at {}",root.display());Ok(())}
-pub fn load(root:&Path)->Result<Config>{let path=root.join("sryza.toml");let contents=fs::read_to_string(&path).with_context(||format!("read {} (run init first)",path.display()))?;let c:Config=toml::from_str(&contents).context("parse sryza.toml")?;anyhow::ensure!((1..=20).contains(&c.performance.target_tps),"target_tps must be 1..=20");anyhow::ensure!(c.network.max_packet_bytes>=1024,"max_packet_bytes must be at least 1024");Ok(c)}
-pub fn migration_report(source:&Path,destination:&Path)->Result<()>{anyhow::ensure!(source.is_dir(),"source directory does not exist: {}",source.display());fs::create_dir_all(destination)?;let names=["server.properties","bukkit.yml","spigot.yml","paper.yml","paper-global.yml","paper-world-defaults.yml"];let found:Vec<_>=names.iter().filter(|n|source.join(n).exists()).copied().collect();let jars=source.join("plugins");let count=if jars.is_dir(){fs::read_dir(jars)?.filter_map(|e|e.ok()).filter(|e|e.path().extension().is_some_and(|x|x=="jar")).count()}else{0};let report=format!("# SryzaMC migration assessment\n\nSource: `{}`\n\nDetected config: {}\nDetected plugin JARs: {}\n\nNo data was copied or modified. This build does not translate Paper settings or execute Java plugins.\n",source.display(),if found.is_empty(){"none".into()}else{found.join(", ")},count);let p=destination.join("MIGRATION-REPORT.md");fs::write(&p,report)?;println!("Wrote {}",p.display());Ok(())}
-#[cfg(test)] mod tests{use super::*;#[test]fn defaults_round_trip(){let c=Config::default();let t=toml::to_string(&c).unwrap();let d:Config=toml::from_str(&t).unwrap();assert_eq!(d.server.max_players,20);assert!(d.server.online_mode);}#[test]fn shipped_template_parses(){let c:Config=toml::from_str(include_str!("../../../config/sryza.toml")).unwrap();assert_eq!(c.network.listen.port(),25565);assert!(c.server.online_mode);}}
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::{fs, net::SocketAddr, path::Path};
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Config {
+    pub server: ServerConfig,
+    pub performance: PerformanceConfig,
+    pub world: WorldConfig,
+    pub entities: EntityConfig,
+    pub network: NetworkConfig,
+    pub runtime: RuntimeConfig,
+    pub plugins: PluginConfig,
+    pub permissions: PermissionConfig,
+    pub commands: CommandConfig,
+    pub logging: LoggingConfig,
+    pub security: SecurityConfig,
+    pub backup: BackupConfig,
+    pub resources: ResourceConfig,
+    pub monitoring: MonitoringConfig,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    pub motd: String,
+    pub max_players: u16,
+    pub online_mode: bool,
+    pub view_distance: u8,
+    pub simulation_distance: u8,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceConfig {
+    pub target_tps: u8,
+    pub tick_budget_ms: u16,
+    pub worker_threads: usize,
+    pub async_chunk_io: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorldConfig {
+    pub name: String,
+    pub seed: i64,
+    pub autosave_seconds: u32,
+    pub compression_level: u8,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityConfig {
+    pub activation_range: u8,
+    pub max_per_chunk: u16,
+    pub tracking_range: u8,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    pub listen: SocketAddr,
+    pub max_packet_bytes: usize,
+    pub compression_threshold: i32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    pub java_bridge: bool,
+    pub java_executable: String,
+    pub plugin_api: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    pub directory: String,
+    pub allowlist_only: bool,
+    pub load_timeout_seconds: u32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionConfig {
+    pub default_group: String,
+    pub op_level: u8,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandConfig {
+    pub prefix: String,
+    pub confirm_destructive: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    pub level: String,
+    pub directory: String,
+    pub json: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    pub proxy_protocol: bool,
+    pub max_connections_per_ip: u16,
+    pub enforce_authentication: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    pub interval_minutes: u32,
+    pub retain: u16,
+    pub directory: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceConfig {
+    pub max_open_files: u32,
+    pub max_pending_chunks: u32,
+    pub max_packet_queue: u32,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoringConfig {
+    pub metrics: bool,
+    pub bind: SocketAddr,
+    pub debug_commands: bool,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig {
+                motd: "A SryzaMC server".into(),
+                max_players: 20,
+                online_mode: true,
+                view_distance: 10,
+                simulation_distance: 8,
+            },
+            performance: PerformanceConfig {
+                target_tps: 20,
+                tick_budget_ms: 50,
+                worker_threads: 0,
+                async_chunk_io: true,
+            },
+            world: WorldConfig {
+                name: "world".into(),
+                seed: 0,
+                autosave_seconds: 300,
+                compression_level: 3,
+            },
+            entities: EntityConfig {
+                activation_range: 32,
+                max_per_chunk: 70,
+                tracking_range: 10,
+            },
+            network: NetworkConfig {
+                listen: "0.0.0.0:25565".parse().unwrap(),
+                max_packet_bytes: 2097152,
+                compression_threshold: 256,
+            },
+            runtime: RuntimeConfig {
+                java_bridge: false,
+                java_executable: "java".into(),
+                plugin_api: "paper-1.21".into(),
+            },
+            plugins: PluginConfig {
+                directory: "plugins".into(),
+                allowlist_only: true,
+                load_timeout_seconds: 30,
+            },
+            permissions: PermissionConfig {
+                default_group: "default".into(),
+                op_level: 4,
+            },
+            commands: CommandConfig {
+                prefix: "/".into(),
+                confirm_destructive: true,
+            },
+            logging: LoggingConfig {
+                level: "info".into(),
+                directory: "logs".into(),
+                json: false,
+            },
+            security: SecurityConfig {
+                proxy_protocol: false,
+                max_connections_per_ip: 5,
+                enforce_authentication: true,
+            },
+            backup: BackupConfig {
+                enabled: false,
+                interval_minutes: 60,
+                retain: 24,
+                directory: "backups".into(),
+            },
+            resources: ResourceConfig {
+                max_open_files: 4096,
+                max_pending_chunks: 512,
+                max_packet_queue: 4096,
+            },
+            monitoring: MonitoringConfig {
+                metrics: false,
+                bind: "127.0.0.1:9100".parse().unwrap(),
+                debug_commands: false,
+            },
+        }
+    }
+}
+pub fn initialize(root: &Path) -> Result<()> {
+    fs::create_dir_all(root)?;
+    for d in ["world", "plugins", "logs", "backups", "config"] {
+        fs::create_dir_all(root.join(d))?;
+    }
+    let path = root.join("sryza.toml");
+    if path.exists() {
+        anyhow::bail!("{} already exists; refusing to overwrite", path.display());
+    }
+    fs::write(path, include_str!("../../../config/sryza.toml"))?;
+    let props = root.join("server.properties");
+    if !props.exists() {
+        fs::write(props, include_str!("../../../config/server.properties"))?;
+    }
+    println!("Initialized SryzaMC data directory at {}", root.display());
+    Ok(())
+}
+pub fn load(root: &Path) -> Result<Config> {
+    let path = root.join("sryza.toml");
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("read {} (run init first)", path.display()))?;
+    let c: Config = toml::from_str(&contents).context("parse sryza.toml")?;
+    anyhow::ensure!(
+        (1..=20).contains(&c.performance.target_tps),
+        "target_tps must be 1..=20"
+    );
+    anyhow::ensure!(
+        c.network.max_packet_bytes >= 1024,
+        "max_packet_bytes must be at least 1024"
+    );
+    Ok(c)
+}
+pub fn migration_report(source: &Path, destination: &Path) -> Result<()> {
+    anyhow::ensure!(
+        source.is_dir(),
+        "source directory does not exist: {}",
+        source.display()
+    );
+    fs::create_dir_all(destination)?;
+    let names = [
+        "server.properties",
+        "bukkit.yml",
+        "spigot.yml",
+        "paper.yml",
+        "paper-global.yml",
+        "paper-world-defaults.yml",
+    ];
+    let found: Vec<_> = names
+        .iter()
+        .filter(|n| source.join(n).exists())
+        .copied()
+        .collect();
+    let jars = source.join("plugins");
+    let count = if jars.is_dir() {
+        fs::read_dir(jars)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jar"))
+            .count()
+    } else {
+        0
+    };
+    let report=format!("# SryzaMC migration assessment\n\nSource: `{}`\n\nDetected config: {}\nDetected plugin JARs: {}\n\nNo data was copied or modified. This build does not translate Paper settings or execute Java plugins.\n",source.display(),if found.is_empty(){"none".into()}else{found.join(", ")},count);
+    let p = destination.join("MIGRATION-REPORT.md");
+    fs::write(&p, report)?;
+    println!("Wrote {}", p.display());
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn defaults_round_trip() {
+        let c = Config::default();
+        let t = toml::to_string(&c).unwrap();
+        let d: Config = toml::from_str(&t).unwrap();
+        assert_eq!(d.server.max_players, 20);
+        assert!(d.server.online_mode);
+    }
+    #[test]
+    fn shipped_template_parses() {
+        let c: Config = toml::from_str(include_str!("../../../config/sryza.toml")).unwrap();
+        assert_eq!(c.network.listen.port(), 25565);
+        assert!(c.server.online_mode);
+    }
+}

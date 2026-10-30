@@ -4,7 +4,7 @@
 
 | Section | Fields | Current status |
 |---|---|---|
-| `server` | `motd`, `max_players`, `online_mode`, `view_distance`, `simulation_distance` | Not used for login or simulation. |
+| `server` | `motd`, `max_players`, `online_mode`, `view_distance`, `simulation_distance` | MOTD/player maximum are used for status. Offline mode supports Login then disconnects at Configuration; online mode rejects login until encryption/authentication land. |
 | `performance` | `target_tps`, `tick_budget_ms`, `worker_threads`, `async_chunk_io` | TPS range validated; tick clock is scaffolding. |
 | `world` | `name`, `seed`, `autosave_seconds`, `compression_level` | World generation/storage absent. |
 | `entities` | `activation_range`, `max_per_chunk`, `tracking_range` | Entity engine absent. |

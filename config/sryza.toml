@@ -2,7 +2,7 @@
 [server]
 motd = "A SryzaMC server" # Server-list status text.
 max_players = 20 # Maximum simultaneous players.
-online_mode = true # Authentication policy; authentication is not implemented yet.
+online_mode = true # Secure default. Online auth currently rejects logins; false permits offline login only, then disconnects at Configuration.
 view_distance = 10 # Planned chunk send radius in chunks.
 simulation_distance = 8 # Planned simulation radius in chunks.
 [performance]

@@ -1,6 +1,6 @@
 # SryzaMC
 
-SryzaMC is an independent Rust Minecraft Java Edition server project. The current executable accepts Minecraft handshake connections and implements server-list status and ping for protocol 777 (26.3). Login and gameplay are not implemented yet, so players cannot join a world. No Bukkit, Spigot, or Paper plugin compatibility is claimed.
+SryzaMC is an independent Rust Minecraft Java Edition server project. The current executable accepts Minecraft handshake connections and implements status/ping for protocol 777 (26.3). With `online_mode = false`, it performs the offline Login exchange and then disconnects at Configuration because registry synchronization is not implemented. With secure default `online_mode = true`, it rejects login because encryption and Mojang verification are not integrated yet. Players cannot join a world. No Bukkit, Spigot, or Paper plugin compatibility is claimed.
 
 ## Java plugin compatibility
 
