@@ -1,0 +1,7 @@
+/target/
+/server/
+/world/
+/plugins/*.jar
+/logs/
+/backups/
+*.profraw

@@ -1,0 +1,60 @@
+# SryzaMC operator configuration. Safe defaults; many planned settings are not active yet.
+[server]
+motd = "A SryzaMC server" # Server-list status text.
+max_players = 20 # Maximum simultaneous players.
+online_mode = true # Authentication policy; authentication is not implemented yet.
+view_distance = 10 # Planned chunk send radius in chunks.
+simulation_distance = 8 # Planned simulation radius in chunks.
+[performance]
+target_tps = 20 # Tick target, validated in range 1..20; current clock is scaffolding.
+tick_budget_ms = 50 # Planned per-tick budget.
+worker_threads = 0 # Tokio worker count; 0 means runtime default (currently unused).
+async_chunk_io = true # Planned asynchronous world I/O.
+[world]
+name = "world" # Primary world folder name.
+seed = 0 # Planned world seed; zero will select a random seed (currently unused).
+autosave_seconds = 300 # Planned save interval.
+compression_level = 3 # Planned storage compression setting.
+[entities]
+activation_range = 32 # Planned activation distance in blocks.
+max_per_chunk = 70 # Planned soft cap.
+tracking_range = 10 # Planned player tracking distance in chunks.
+[network]
+listen = "0.0.0.0:25565" # Bind address; use firewall rules on exposed hosts.
+max_packet_bytes = 2097152 # Hard frame size bound to limit hostile allocations.
+compression_threshold = 256 # Planned protocol compression threshold.
+[runtime]
+java_bridge = false # No bridge exists. Enabling this has no effect.
+java_executable = "java" # Planned bridge JVM executable.
+plugin_api = "paper-1.21" # Planned target only; API is absent.
+[plugins]
+directory = "plugins" # Planned JAR folder.
+allowlist_only = true # Safe default for future arbitrary code execution.
+load_timeout_seconds = 30 # Planned startup timeout.
+[permissions]
+default_group = "default" # Planned default player group.
+op_level = 4 # Planned vanilla operator level.
+[commands]
+prefix = "/" # Planned command prefix.
+confirm_destructive = true # Planned destructive command confirmation.
+[logging]
+level = "info" # tracing level; RUST_LOG can override.
+directory = "logs" # Planned file log destination.
+json = false # Planned structured file output.
+[security]
+proxy_protocol = false # Proxy header support is absent.
+max_connections_per_ip = 5 # Planned per-address connection cap.
+enforce_authentication = true # Authentication is absent despite this future policy default.
+[backup]
+enabled = false # Backups are not implemented.
+interval_minutes = 60 # Planned snapshot cadence.
+retain = 24 # Planned retained snapshots.
+directory = "backups" # Planned destination.
+[resources]
+max_open_files = 4096 # Planned file descriptor budget; not enforced.
+max_pending_chunks = 512 # Planned chunk task bound; not enforced.
+max_packet_queue = 4096 # Concurrent connection handler bound used by current listener.
+[monitoring]
+metrics = false # Metrics endpoint is absent.
+bind = "127.0.0.1:9100" # Planned metrics bind; localhost default.
+debug_commands = false # Planned debug command switch.
